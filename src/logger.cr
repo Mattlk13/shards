@@ -1,42 +1,52 @@
-require "logger"
 require "colorize"
+require "log"
 
 module Shards
-  LOGGER_COLORS = {
-    "ERROR" => :red,
-    "WARN"  => :light_yellow,
-    "INFO"  => :light_green,
-    "DEBUG" => :light_gray,
-  }
-
   @@colors = true
 
   def self.colors=(value)
     @@colors = value
   end
+end
 
-  @@logger : Logger?
+Log.setup_from_env(
+  default_sources: "shards.*",
+  backend: Log::IOBackend.new(formatter: Shards::FORMATTER)
+)
 
-  def self.logger
-    @@logger ||= Logger.new(STDOUT).tap do |logger|
-      logger.progname = "shards"
-      logger.level = Logger::Severity::INFO
+module Shards
+  Log = ::Log.for(self)
 
-      logger.formatter = Logger::Formatter.new do |severity, _datetime, _progname, message, io|
-        if @@colors
-          io << if color = LOGGER_COLORS[severity.to_s]?
-            if idx = message.index(' ')
-              message[0...idx].colorize(color).to_s + message[idx..-1]
-            else
-              message.colorize(color)
-            end
-          else
-            message
-          end
+  def self.set_warning_log_level
+    Log.level = ::Log::Severity::Warn
+  end
+
+  def self.set_debug_log_level
+    Log.level = ::Log::Severity::Debug
+  end
+
+  LOGGER_COLORS = {
+    ::Log::Severity::Error => :red,
+    ::Log::Severity::Warn  => :yellow,
+    ::Log::Severity::Info  => :green,
+    ::Log::Severity::Debug => :light_gray,
+  }
+
+  FORMATTER = ::Log::Formatter.new do |entry, io|
+    message = entry.message
+
+    if @@colors
+      io << if color = LOGGER_COLORS[entry.severity]?
+        if idx = message.index(' ')
+          message[0...idx].colorize(color).to_s + message[idx..-1]
         else
-          io << severity.to_s[0] << ": " << message
+          message.colorize(color)
         end
+      else
+        message
       end
+    else
+      io << entry.severity.label[0] << ": " << message
     end
   end
 end

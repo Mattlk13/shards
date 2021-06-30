@@ -1,9 +1,94 @@
 require "uri"
 require "./resolver"
 require "../versions"
-require "../helpers/path"
+require "../logger"
+require "../helpers"
 
 module Shards
+  abstract struct GitRef < Ref
+    def full_info
+      to_s
+    end
+  end
+
+  struct GitBranchRef < GitRef
+    def initialize(@branch : String)
+    end
+
+    def to_git_ref
+      "refs/heads/#{@branch}"
+    end
+
+    def to_s(io)
+      io << "branch " << @branch
+    end
+
+    def to_yaml(yaml)
+      yaml.scalar "branch"
+      yaml.scalar @branch
+    end
+  end
+
+  struct GitTagRef < GitRef
+    def initialize(@tag : String)
+    end
+
+    def to_git_ref
+      "refs/tags/#{@tag}"
+    end
+
+    def to_s(io)
+      io << "tag " << @tag
+    end
+
+    def to_yaml(yaml)
+      yaml.scalar "tag"
+      yaml.scalar @tag
+    end
+  end
+
+  struct GitCommitRef < GitRef
+    getter commit : String
+
+    def initialize(@commit : String)
+    end
+
+    def =~(other : GitCommitRef)
+      commit.starts_with?(other.commit) || other.commit.starts_with?(commit)
+    end
+
+    def to_git_ref
+      @commit
+    end
+
+    def to_s(io)
+      io << "commit " << @commit[0...7]
+    end
+
+    def full_info
+      "commit #{@commit}"
+    end
+
+    def to_yaml(yaml)
+      yaml.scalar "commit"
+      yaml.scalar @commit
+    end
+  end
+
+  struct GitHeadRef < GitRef
+    def to_git_ref
+      "HEAD"
+    end
+
+    def to_s(io)
+      io << "HEAD"
+    end
+
+    def to_yaml(yaml)
+      raise NotImplementedError.new("GitHeadRef is for internal use only")
+    end
+  end
+
   class GitResolver < Resolver
     @@has_git_command : Bool?
     @@git_column_never : String?
@@ -15,9 +100,34 @@ module Shards
       "git"
     end
 
+    private KNOWN_PROVIDERS = {"www.github.com", "github.com", "www.bitbucket.com", "bitbucket.com", "www.gitlab.com", "gitlab.com"}
+
+    def self.normalize_key_source(key : String, source : String) : {String, String}
+      case key
+      when "git"
+        uri = URI.parse(source)
+        downcased_host = uri.host.try &.downcase
+        scheme = uri.scheme.try &.downcase
+        if scheme.in?("git", "http", "https") && downcased_host && downcased_host.in?(KNOWN_PROVIDERS)
+          # browsers are requested to enforce HTTP Strict Transport Security
+          uri.scheme = "https"
+          downcased_path = uri.path.downcase
+          uri.path = downcased_path.ends_with?(".git") ? downcased_path : "#{downcased_path}.git"
+          uri.host = downcased_host.lchop("www.")
+          {"git", uri.to_s}
+        else
+          {"git", source}
+        end
+      when "github", "bitbucket", "gitlab"
+        {"git", "https://#{key}.com/#{source.downcase}.git"}
+      else
+        raise "Unknown resolver #{key}"
+      end
+    end
+
     protected def self.has_git_command?
       if @@has_git_command.nil?
-        @@has_git_command = Process.run("command -v git", shell: true).success?
+        @@has_git_command = (Process.run("git", ["--version"]).success? rescue false)
       end
       @@has_git_command
     end
@@ -30,112 +140,98 @@ module Shards
       @@git_column_never ||= Versions.compare(git_version, "1.7.11") < 0 ? "--column=never" : ""
     end
 
-    def read_spec(version = "*")
+    def read_spec(version : Version) : String?
       update_local_cache
-      refs = git_refs(version)
+      ref = git_ref(version)
 
-      if file_exists?(refs, SPEC_FILENAME)
-         capture("git show #{refs}:#{SPEC_FILENAME}")
+      if file_exists?(ref, SPEC_FILENAME)
+        capture("git show #{Process.quote("#{ref.to_git_ref}:#{SPEC_FILENAME}")}")
       else
-        raise Error.new("Missing \"#{refs}:#{SPEC_FILENAME}\" for #{dependency.name.inspect}")
+        Log.debug { "Missing \"#{SPEC_FILENAME}\" for #{name.inspect} at #{ref}" }
+        nil
       end
     end
 
-    def specs(versions)
-      specs = {} of String => Spec
-
-      versions.each do |version|
-        refs = git_refs(version)
-        yaml = capture("git show #{refs}:#{SPEC_FILENAME}")
-        specs[version] = Spec.from_yaml(yaml)
+    private def spec_at_ref(ref : GitRef) : Spec?
+      update_local_cache
+      begin
+        if file_exists?(ref, SPEC_FILENAME)
+          spec_yaml = capture("git show #{Process.quote("#{ref.to_git_ref}:#{SPEC_FILENAME}")}")
+          Spec.from_yaml(spec_yaml)
+        end
       rescue Error
+        nil
       end
-
-      specs
     end
 
-    def spec?(version)
-      refs = git_refs(version)
-      yaml = capture("git show #{refs}:#{SPEC_FILENAME}")
-      Spec.from_yaml(yaml)
+    private def spec?(version)
+      spec(version)
     rescue Error
     end
 
-    def available_versions
+    def available_releases : Array(Version)
       update_local_cache
+      versions_from_tags
+    end
 
-      versions = versions_from_tags
+    def latest_version_for_ref(ref : GitRef?) : Version
+      update_local_cache
+      ref ||= GitHeadRef.new
+      begin
+        commit = commit_sha1_at(ref)
+      rescue Error
+        raise Error.new "Could not find #{ref.full_info} for shard #{name.inspect} in the repository #{source}"
+      end
 
-      if versions.any?
-        Shards.logger.debug { "versions: #{versions.reverse.join(", ")}" }
-        versions
+      if spec = spec_at_ref(ref)
+        Version.new "#{spec.version.value}+git.commit.#{commit}"
       else
-        ["HEAD"]
+        raise Error.new "No #{SPEC_FILENAME} was found for shard #{name.inspect} at commit #{commit}"
       end
     end
 
-    protected def versions_from_tags(refs = nil)
-      options = "--contains #{refs}" if refs
+    def matches_ref?(ref : GitRef, version : Version)
+      case ref
+      when GitCommitRef
+        ref =~ git_ref(version)
+      when GitBranchRef, GitHeadRef
+        # TODO: check if version is the branch
+        version.has_metadata?
+      else
+        # TODO: check branch and tags
+        true
+      end
+    end
 
-      capture("git tag --list #{options} #{GitResolver.git_column_never}")
+    protected def versions_from_tags
+      capture("git tag --list #{GitResolver.git_column_never}")
         .split('\n')
-        .compact_map { |tag| $1 if tag =~ VERSION_TAG }
+        .compact_map { |tag| Version.new($1) if tag =~ VERSION_TAG }
     end
 
-    def matches?(commit)
-      if branch = dependency["branch"]?
-        capture("git branch --list #{GitResolver.git_column_never} --contains #{commit}")
-          .split('\n')
-          .compact_map { |line| $1? if line =~ /^[* ] (.+)$/ }
-          .includes?(branch)
-      elsif tag = dependency["tag"]?
-        capture("git tag --list #{GitResolver.git_column_never} --contains #{commit}")
-          .split('\n')
-          .includes?(tag)
-      else
-        !capture("git log -n 1 #{commit}").strip.empty?
-      end
-    end
-
-    def install(version = nil)
+    def install_sources(version : Version, install_path : String)
       update_local_cache
-      refs = version && git_refs(version) || "HEAD"
+      ref = git_ref(version)
 
-      cleanup_install_directory
       Dir.mkdir_p(install_path)
-
-      unless file_exists?(refs, SPEC_FILENAME)
-        File.write(File.join(install_path, "shard.yml"), read_spec(version))
-      end
-
-      run "git archive --format=tar --prefix= #{refs} | tar -x -f - -C #{Helpers::Path.escape(install_path)}"
-
-      if version =~ VERSION_REFERENCE
-        File.delete(sha1_path) if File.exists?(sha1_path)
-      else
-        File.write(sha1_path, commit_sha1_at(version))
-      end
+      run "git --work-tree=#{Process.quote(install_path)} checkout #{Process.quote(ref.to_git_ref)} -- ."
     end
 
-    def commit_sha1_at(refs)
-      capture("git log -n 1 --pretty=%H #{refs}").strip
-    end
-
-    def installed_commit_hash
-      File.read(sha1_path).strip if installed? && File.exists?(sha1_path)
-    end
-
-    def sha1_path
-      @sha1_path ||= File.join(Shards.install_path, "#{dependency.name}.sha1")
+    def commit_sha1_at(ref : GitRef)
+      capture("git log -n 1 --pretty=%H #{Process.quote(ref.to_git_ref)}").strip
     end
 
     def local_path
       @local_path ||= begin
-        uri = URI.parse(git_url)
+        uri = parse_uri(git_url)
 
-        path = uri.path.to_s[1..-1]
-        path = path.gsub('/', File::SEPARATOR) unless File::SEPARATOR == '/'
+        path = uri.path
         path += ".git" unless path.ends_with?(".git")
+        path = Path[path]
+        # E.g. turns "c:\local\path.git" into "c\local\path.git". Or just drops the leading slash.
+        if (anchor = path.anchor)
+          path = Path[path.drive.to_s.rchop(":"), path.relative_to(anchor)]
+        end
 
         if host = uri.host
           File.join(Shards.cache_path, host, path)
@@ -146,46 +242,45 @@ module Shards
     end
 
     def git_url
-      dependency["git"].to_s.strip
+      source.strip
     end
 
-    private def git_refs(version)
-      case version
-      when VERSION_REFERENCE
-        if version && version.starts_with?('v')
-          version
+    def parse_requirement(params : Hash(String, String)) : Requirement
+      params.each do |key, value|
+        case key
+        when "branch"
+          return GitBranchRef.new value
+        when "tag"
+          return GitTagRef.new value
+        when "commit"
+          return GitCommitRef.new value
         else
-          "v#{version}"
         end
+      end
+
+      super
+    end
+
+    record GitVersion, value : String, commit : String? = nil
+
+    private def parse_git_version(version : Version) : GitVersion
+      case version.value
+      when VERSION_REFERENCE
+        GitVersion.new version.value
       when VERSION_AT_GIT_COMMIT
-        $1
-      when "*"
-        "HEAD"
+        GitVersion.new $1, $2
       else
-        version || "HEAD"
+        raise Error.new("Invalid version for git resolver: #{version}")
       end
     end
 
-    protected def version_at(refs)
-      update_local_cache
-
-      if spec = spec?(refs)
-        spec.version
+    private def git_ref(version : Version) : GitRef
+      git_version = parse_git_version(version)
+      if commit = git_version.commit
+        GitCommitRef.new commit
       else
-        # FIXME: return the latest release tag BEFORE or AT the refs exactly, but
-        #        never release tags AFTER the refs
-        versions_from_tags(refs).first?
+        GitTagRef.new "v#{git_version.value}"
       end
-    end
-
-    private def refs_at(commit)
-      update_local_cache
-
-      refs = [] of String?
-      refs << commit
-      refs += capture("git tag --list --contains #{commit} #{GitResolver.git_column_never}").split('\n')
-      refs += capture("git branch --list --contains #{commit} #{GitResolver.git_column_never}").split(' ')
-      refs.compact.uniq
     end
 
     private def update_local_cache
@@ -195,7 +290,7 @@ module Shards
       end
 
       return if Shards.local? || @updated_cache
-      Shards.logger.info "Fetching #{git_url}"
+      Log.info { "Fetching #{git_url}" }
 
       if cloned_repository?
         # repositories cloned with shards v0.8.0 won't fetch any new remote
@@ -214,20 +309,39 @@ module Shards
     end
 
     private def mirror_repository
-      run_in_current_folder "git clone --mirror --quiet -- #{Helpers::Path.escape(git_url)} #{local_path}"
-    rescue Error
-      raise Error.new("Failed to clone #{git_url}")
+      # The git-config option core.askPass is set to a command that is to be
+      # called when git needs to ask for credentials (for example on a 401
+      # response over HTTP). Setting the command to `true` effectively
+      # disables the credential prompt, because `shards install` is not to
+      # be used interactively.
+      # This configuration can be overriden by defining the environment
+      # variable `GIT_ASKPASS`.
+      git_retry(err: "Failed to clone #{git_url}") do
+        run_in_current_folder "git clone -c core.askPass=true --mirror --quiet -- #{Process.quote(git_url)} #{Process.quote(local_path)}"
+      end
     end
 
     private def fetch_repository
-      run "git fetch --all --quiet"
-    rescue Error
-      raise Error.new("Failed to update #{git_url}")
+      git_retry(err: "Failed to update #{git_url}") do
+        run "git fetch --all --quiet"
+      end
+    end
+
+    private def git_retry(err = "Failed to fetch repository")
+      retries = 0
+      loop do
+        yield
+        break
+      rescue Error
+        retries += 1
+        next if retries < 3
+        raise Error.new(err)
+      end
     end
 
     private def delete_repository
-      Shards.logger.debug "rm -rf '#{local_path}'"
-      FileUtils.rm_rf(local_path)
+      Log.debug { "rm -rf #{Process.quote(local_path)}'" }
+      Shards::Helpers.rm_rf(local_path)
       @origin_url = nil
     end
 
@@ -242,17 +356,54 @@ module Shards
       false
     end
 
-    private def origin_changed?
-      (@origin_url ||= capture("git ls-remote --get-url origin").strip) != git_url
+    private def origin_url
+      @origin_url ||= capture("git ls-remote --get-url origin").strip
     end
 
-    private def file_exists?(refs, path)
-      files = capture("git ls-tree -r --full-tree --name-only #{refs} -- #{path}")
+    # Returns whether origin URLs have differing hosts and/or paths.
+    protected def origin_changed?
+      return false if origin_url == git_url
+      return true if origin_url.nil? || git_url.nil?
+
+      origin_parsed = parse_uri(origin_url)
+      git_parsed = parse_uri(git_url)
+
+      (origin_parsed.host != git_parsed.host) || (origin_parsed.path != git_parsed.path)
+    end
+
+    # Parses a URI string, with additional support for ssh+git URI schemes.
+    private def parse_uri(raw_uri)
+      # Need to check for file URIs early, otherwise generic parsing will fail on a colon.
+      if (path = raw_uri.lchop?("file://"))
+        return URI.new(scheme: "file", path: path)
+      end
+
+      # Try normal URI parsing first
+      uri = URI.parse(raw_uri)
+      return uri if uri.absolute? && !uri.opaque?
+
+      # Otherwise, assume and attempt to parse the scp-style ssh URIs
+      host, _, path = raw_uri.partition(':')
+
+      if host.includes?('@')
+        user, _, host = host.partition('@')
+      end
+
+      # Normalize leading slash, matching URI parsing
+      unless path.starts_with?('/')
+        path = '/' + path
+      end
+
+      URI.new(scheme: "ssh", host: host, path: path, user: user)
+    end
+
+    private def file_exists?(ref : GitRef, path)
+      files = capture("git ls-tree -r --full-tree --name-only #{Process.quote(ref.to_git_ref)} -- #{Process.quote(path)}")
       !files.strip.empty?
     end
 
     private def capture(command, path = local_path)
-      run(command, capture: true, path: local_path).not_nil!
+      run(command, capture: true, path: path).not_nil!
     end
 
     private def run(command, path = local_path, capture = false)
@@ -270,11 +421,11 @@ module Shards
         raise Error.new("Error missing git command line tool. Please install Git first!")
       end
 
-      Shards.logger.debug command
+      Log.debug { command }
 
       output = capture ? IO::Memory.new : Process::Redirect::Close
       error = IO::Memory.new
-      status = Process.run("/bin/sh", input: IO::Memory.new(command), output: output, error: error)
+      status = Process.run(command, shell: true, output: output, error: error)
 
       if status.success?
         output.to_s if capture
@@ -286,7 +437,19 @@ module Shards
         raise Error.new("Failed #{command} (#{message}). Maybe a commit, branch or file doesn't exist?")
       end
     end
-  end
 
-  register_resolver GitResolver
+    def report_version(version : Version) : String
+      git_version = parse_git_version(version)
+      if commit = git_version.commit
+        "#{git_version.value} at #{commit[0...7]}"
+      else
+        version.value
+      end
+    end
+
+    register_resolver "git", GitResolver
+    register_resolver "github", GitResolver
+    register_resolver "gitlab", GitResolver
+    register_resolver "bitbucket", GitResolver
+  end
 end

@@ -1,70 +1,112 @@
 require "./ext/yaml"
+require "./requirement"
+require "./resolvers/resolver"
 
 module Shards
-  class Dependency < Hash(String, String)
+  class Dependency
     property name : String
+    property resolver : Resolver
+    property requirement : Requirement
 
-    def self.new(pull : YAML::PullParser) : self
-      Dependency.new(pull.read_scalar).tap do |dependency|
-        pull.each_in_mapping do
-          dependency[pull.read_scalar] = pull.read_scalar
+    def initialize(@name : String, @resolver : Resolver, @requirement : Requirement = Any)
+    end
+
+    def self.from_yaml(pull : YAML::PullParser)
+      mapping_start = pull.location
+      name = pull.read_scalar
+      pull.read_mapping do
+        resolver_data = nil
+        params = Hash(String, String).new
+
+        until pull.kind.mapping_end?
+          location = pull.location
+          key, value = pull.read_scalar, pull.read_scalar
+
+          if type = Resolver.find_class(key)
+            if resolver_data
+              raise YAML::ParseException.new("Duplicate resolver mapping for dependency #{name.inspect}", *location)
+            else
+              resolver_data = {type: type, key: key, source: value}
+            end
+          else
+            params[key] = value
+          end
         end
+
+        unless resolver_data
+          raise YAML::ParseException.new("Missing resolver for dependency #{name.inspect}", *mapping_start)
+        end
+
+        resolver = resolver_data[:type].find_resolver(resolver_data[:key], name, resolver_data[:source])
+
+        requirement = resolver.parse_requirement(params)
+        Dependency.new(name, resolver, requirement)
       end
     end
 
-    protected def initialize(@name)
-      super()
+    def to_yaml(yaml : YAML::Builder)
+      yaml.scalar name
+      yaml.mapping do
+        yaml.scalar resolver.class.key
+        yaml.scalar resolver.source
+        requirement.to_yaml(yaml)
+      end
     end
 
-    protected def initialize(@name, config)
-      super()
-      config.each { |k, v| self[k.to_s] = v.to_s }
+    def as_package?
+      version =
+        case req = @requirement
+        when VersionReq then Version.new(req.to_s)
+        else
+          # This conversion is used to keep compatibility
+          # with old versions (1.0) of lock files.
+          versions = @resolver.versions_for(req)
+          unless versions.size == 1
+            return
+          end
+          versions.first
+        end
+
+      Package.new(@name, @resolver, version)
     end
 
-    def version
-      version { "*" }
-    end
+    def_equals @name, @resolver, @requirement
 
-    def version?
-      version { nil }
-    end
-
-    private def version
-      if version = self["version"]?
-        version
-      elsif self["tag"]? =~ VERSION_TAG
-        $1
+    def prerelease?
+      case req = requirement
+      when Version
+        req.prerelease?
+      when VersionReq
+        req.prerelease?
       else
-        yield
+        false
       end
     end
 
-    def refs
-      self["branch"]? || self["tag"]? || self["commit"]?
-    end
-
-    def path
-      self["path"]?
-    end
-
-    def to_human_requirement
-      if version = version?
-        version
-      elsif branch = self["branch"]?
-        "branch #{branch}"
-      elsif tag = self["tag"]?
-        "tag #{tag}"
-      elsif commit = self["commit"]?
-        "commit #{commit}"
+    private def report_requirement
+      case req = requirement
+      when Version
+        resolver.report_version(req)
       else
-        "*"
+        req.to_s
       end
     end
 
-    def inspect(io)
-      io << "#<" << self.class.name << " {" << name << " => "
-      super
-      io << "}>"
+    def to_s(io)
+      io << name << " (" << report_requirement << ")"
+    end
+
+    def matches?(version : Version)
+      case req = requirement
+      when Ref
+        resolver.matches_ref?(req, version)
+      when Version
+        req == version
+      when VersionReq
+        Versions.matches?(version, req)
+      when Any
+        true
+      end
     end
   end
 end

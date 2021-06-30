@@ -1,26 +1,43 @@
 .POSIX:
 
-CRYSTAL = crystal
-CRFLAGS =
-SOURCES = src/*.cr src/**/*.cr
+release ?=      ## Compile in release mode
+debug ?=        ## Add symbolic debug info
+static ?=       ## Enable static linking
+
+CRYSTAL ?= crystal
+SHARDS ?= shards
+override FLAGS += $(if $(release),--release )$(if $(debug),-d )$(if $(static),--static )
+
+SHARDS_SOURCES = $(shell find src -name '*.cr')
+MOLINILLO_SOURCES = $(shell find lib/molinillo -name '*.cr' 2> /dev/null)
+SOURCES = $(SHARDS_SOURCES) $(MOLINILLO_SOURCES)
 TEMPLATES = src/templates/*.ecr
 
-DESTDIR =
-PREFIX = /usr/local
-BINDIR = $(DESTDIR)$(PREFIX)/bin
-MANDIR = $(DESTDIR)$(PREFIX)/share/man
-INSTALL = /usr/bin/install
+SHARDS_CONFIG_BUILD_COMMIT := $(shell git rev-parse --short HEAD 2> /dev/null)
+SHARDS_VERSION := $(shell cat VERSION)
+SOURCE_DATE_EPOCH := $(shell (git show -s --format=%ct HEAD || stat -c "%Y" Makefile || stat -f "%m" Makefile) 2> /dev/null)
+EXPORTS := SHARDS_CONFIG_BUILD_COMMIT="$(SHARDS_CONFIG_BUILD_COMMIT)" SOURCE_DATE_EPOCH="$(SOURCE_DATE_EPOCH)"
+DESTDIR ?=
+PREFIX ?= /usr/local
+BINDIR ?= $(DESTDIR)$(PREFIX)/bin
+MANDIR ?= $(DESTDIR)$(PREFIX)/share/man
+INSTALL ?= /usr/bin/install
+
+MOLINILLO_VERSION = $(shell $(CRYSTAL) eval 'require "yaml"; puts YAML.parse(File.read("shard.lock"))["shards"]["molinillo"]["version"]')
+MOLINILLO_URL = "https://github.com/crystal-lang/crystal-molinillo/archive/v$(MOLINILLO_VERSION).tar.gz"
 
 all: bin/shards
 
-clean: phony
+include docs.mk
+
+clean: phony clean_docs
 	rm -f bin/shards
 
-bin/shards: $(SOURCES) $(TEMPLATES)
+bin/shards: $(SOURCES) $(TEMPLATES) lib
 	@mkdir -p bin
-	$(CRYSTAL) build src/shards.cr -o bin/shards $(CRFLAGS)
+	$(EXPORTS) $(CRYSTAL) build $(FLAGS) src/shards.cr -o bin/shards
 
-install: bin/shards phony
+install: bin/shards manpages phony
 	$(INSTALL) -m 0755 -d "$(BINDIR)" "$(MANDIR)/man1" "$(MANDIR)/man5"
 	$(INSTALL) -m 0755 bin/shards "$(BINDIR)"
 	$(INSTALL) -m 0644 man/shards.1 "$(MANDIR)/man1"
@@ -33,10 +50,17 @@ uninstall: phony
 
 test: test_unit test_integration
 
-test_unit: phony
-	$(CRYSTAL) run test/*_test.cr
+test_unit: phony lib
+	$(CRYSTAL) spec ./spec/unit/
 
 test_integration: bin/shards phony
-	$(CRYSTAL) run test/integration/*_test.cr
+	$(CRYSTAL) spec ./spec/integration/
+
+lib: shard.lock
+	mkdir -p lib/molinillo
+	$(SHARDS) install || (curl -L $(MOLINILLO_URL) | tar -xzf - -C lib/molinillo --strip-components=1)
+
+shard.lock: shard.yml
+	$(SHARDS) update
 
 phony:

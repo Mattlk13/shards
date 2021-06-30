@@ -9,30 +9,28 @@ module Shards
         return unless has_dependencies?
         puts "Shards installed:"
         list(spec.dependencies)
-        list(spec.development_dependencies) unless Shards.production?
+        list(spec.development_dependencies) if Shards.with_development?
       end
 
       private def list(dependencies, level = 1)
         dependencies.each do |dependency|
-          resolver = Shards.find_resolver(dependency)
-
-          # FIXME: duplicated from Check#verify
-          unless _spec = resolver.installed_spec
-            Shards.logger.debug { "#{dependency.name}: not installed" }
+          package = Shards.info.installed[dependency.name]?
+          unless package
+            Log.debug { "#{dependency.name}: not installed" }
             raise Error.new("Dependencies aren't satisfied. Install them with 'shards install'")
           end
 
           indent = "  " * level
-          puts "#{indent}* #{_spec.name} (#{_spec.version})"
+          puts "#{indent}* #{package}"
 
           indent_level = @tree ? level + 1 : level
-          list(_spec.dependencies, indent_level)
+          list(package.spec.dependencies, indent_level)
         end
       end
 
       # FIXME: duplicates Check#has_dependencies?
       private def has_dependencies?
-        spec.dependencies.any? || (!Shards.production? && spec.development_dependencies.any?)
+        spec.dependencies.any? || (Shards.with_development? && spec.development_dependencies.any?)
       end
     end
   end

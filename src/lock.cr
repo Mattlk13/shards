@@ -3,68 +3,86 @@ require "./dependency"
 require "./package"
 
 module Shards
-  module Lock
+  class Lock
+    property version : String
+    property shards : Array(Package)
+
+    CURRENT_VERSION = "2.0"
+
+    def initialize(@version : String, @shards : Array(Package))
+    end
+
     def self.from_file(path)
       raise Error.new("Missing #{File.basename(path)}") unless File.exists?(path)
       from_yaml(File.read(path))
     end
 
     def self.from_yaml(str)
-      dependencies = [] of Dependency
+      shards = [] of Package
 
       pull = YAML::PullParser.new(str)
       pull.read_stream do
         pull.read_document do
           pull.read_mapping do
-            key, value = pull.read_scalar, pull.read_scalar
+            key, version = pull.read_scalar, pull.read_scalar
 
-            unless key == "version" && value == "1.0"
+            unless key == "version" && version.in?("1.0", "2.0")
               raise InvalidLock.new
             end
 
             case key = pull.read_scalar
             when "shards"
               pull.each_in_mapping do
-                dependencies << Dependency.new(pull)
+                # Shards are parsed as dependencies to keep
+                # compatiblity with version 1.0. Calls to `as_package?`
+                # will use the resolver to convert potential references
+                # to explicit versions used in 2.0 format.
+                dep = Dependency.from_yaml(pull)
+                if package = dep.as_package?
+                  shards << package
+                else
+                  Log.warn { "Lock for shard \"#{dep.name}\" is invalid" }
+                end
               end
             else
-              pull.raise "No such attribute #{key} in lock version 1.0"
+              pull.raise "No such attribute #{key} in lock version #{version}"
             end
+
+            Lock.new(version, shards)
           end
         end
       end
-
-      dependencies
     rescue ex : YAML::ParseException
-      # raise ParseError.new(ex.message, str, LOCK_FILENAME, ex.line_number, ex.column_number)
       raise Error.new("Invalid #{LOCK_FILENAME}. Please delete it and run install again.")
     ensure
       pull.close if pull
     end
 
-    def self.write(packages : Array(Package), path : String)
+    def self.write(packages : Array(Package), override_path : String?, path : String)
       File.open(path, "w") do |file|
-        write(packages, file)
+        write(packages, override_path, file)
       end
     end
 
-    def self.write(packages : Array(Package), io : IO)
-      io << "version: 1.0\n"
-      io << "shards:\n"
+    def self.write(packages : Array(Package), override_path : String?, io : IO)
+      if packages.any?(&.is_override)
+        io << "# NOTICE: This lockfile contains some overrides from #{override_path}\n"
+      end
+      io << "version: #{CURRENT_VERSION}\n"
+      io << "shards:"
 
-      packages.sort_by!(&.name).each do |package|
-        key = package.resolver.class.key
+      if packages.empty?
+        io << " {}\n"
+      else
+        io.puts
+        packages.sort_by!(&.name).each do |package|
+          key = package.resolver.class.key
 
-        io << "  " << package.name << ":\n"
-        io << "    " << key << ": " << package.resolver.dependency[key] << '\n'
-
-        if package.commit
-          io << "    commit: " << package.commit << '\n'
-        else
-          io << "    version: " << package.version << '\n'
+          io << "  " << package.name << ":#{package.is_override ? " # Overridden" : nil}\n"
+          io << "    " << key << ": " << package.resolver.source << '\n'
+          io << "    version: " << package.version.value << '\n'
+          io << '\n'
         end
-
-        io << '\n'
       end
     end
   end

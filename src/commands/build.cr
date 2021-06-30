@@ -4,8 +4,12 @@ module Shards
   module Commands
     class Build < Command
       def run(targets, options)
+        if spec.targets.empty?
+          raise Error.new("Targets not defined in #{SPEC_FILENAME}")
+        end
+
         unless Dir.exists?(Shards.bin_path)
-          Shards.logger.debug "mkdir #{Shards.bin_path}"
+          Log.debug { "mkdir #{Shards.bin_path}" }
           Dir.mkdir(Shards.bin_path)
         end
 
@@ -23,7 +27,7 @@ module Shards
       end
 
       private def build(target, options)
-        Shards.logger.info { "Building: #{target.name}" }
+        Log.info { "Building: #{target.name}" }
 
         args = [
           "build",
@@ -31,7 +35,7 @@ module Shards
           target.main,
         ]
         options.each { |option| args << option }
-        Shards.logger.debug { "crystal #{args.join(' ')}" }
+        Log.debug { "crystal #{args.join(' ')}" }
 
         error = IO::Memory.new
         status = Process.run("crystal", args: args, output: Process::Redirect::Inherit, error: error)

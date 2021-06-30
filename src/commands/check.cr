@@ -8,63 +8,53 @@ module Shards
         if has_dependencies?
           locks # ensures that lockfile exists
           verify(spec.dependencies)
-          verify(spec.development_dependencies) unless Shards.production?
+          verify(spec.development_dependencies) if Shards.with_development?
         end
 
-        Shards.logger.info "Dependencies are satisfied"
+        Log.info { "Dependencies are satisfied" }
       end
 
       private def has_dependencies?
-        spec.dependencies.any? || (!Shards.production? && spec.development_dependencies.any?)
+        spec.dependencies.any? || (Shards.with_development? && spec.development_dependencies.any?)
       end
 
       private def verify(dependencies)
-        dependencies.each do |dependency|
-          Shards.logger.debug { "#{dependency.name}: checking..." }
-          resolver = Shards.find_resolver(dependency)
+        apply_overrides(dependencies).each do |dependency|
+          Log.debug { "#{dependency.name}: checking..." }
 
-          unless _spec = resolver.installed_spec
-            Shards.logger.debug { "#{dependency.name}: not installed" }
+          unless installed?(dependency)
             raise Error.new("Dependencies aren't satisfied. Install them with 'shards install'")
           end
-
-          unless installed?(dependency, _spec)
-            raise Error.new("Dependencies aren't satisfied. Install them with 'shards install'")
-          end
-
-          verify(_spec.dependencies)
         end
       end
 
-      private def installed?(dependency, spec)
-        unless lock = locks.find { |d| d.name == spec.name }
-          Shards.logger.debug { "#{dependency.name}: not locked" }
+      private def installed?(dependency)
+        unless lock = locks.shards.find { |d| d.name == dependency.name }
+          Log.debug { "#{dependency.name}: not locked" }
           return false
         end
 
-        if version = lock["version"]?
-          if Versions.resolve([version], dependency.version).empty?
-            Shards.logger.debug { "#{dependency.name}: lock conflict" }
-            return false
-          else
-            return spec.version == version
-          end
-        end
-
-        #if commit = lock["commit"]?
-        #  if resolver.responds_to?(:installed_commit)
-        #    return resolver.installed_commit == commit
-        #  else
-        #    return false
-        #  end
-        #end
-
-        if Versions.resolve([spec.version], dependency.version).empty?
-          Shards.logger.debug { "#{dependency.name}: version mismatch" }
+        if dependency.resolver != lock.resolver
+          Log.debug { "#{dependency.name}: source changed" }
           return false
+        elsif !dependency.matches?(lock.version)
+          Log.debug { "#{dependency.name}: lock conflict" }
+          return false
+        else
+          return false unless lock.installed?
+          verify(lock.spec.dependencies)
+          return true
         end
+      end
 
-        true
+      # FIXME: duplicates MolinilloSolver#on_override
+      def on_override(dependency : Dependency) : Dependency?
+        override.try(&.dependencies.find { |o| o.name == dependency.name })
+      end
+
+      # FIXME: duplicates MolinilloSolver#apply_overrides
+      def apply_overrides(deps : Array(Dependency))
+        deps.map { |dep| on_override(dep) || dep }
       end
     end
   end

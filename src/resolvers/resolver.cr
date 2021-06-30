@@ -6,79 +6,128 @@ require "../script"
 
 module Shards
   abstract class Resolver
-    getter dependency : Dependency
+    getter name : String
+    getter source : String
 
-    def initialize(@dependency)
+    def initialize(@name : String, @source : String)
     end
 
-    def spec(version = nil)
-      Spec.from_yaml(read_spec(version))
+    def self.build(key : String, name : String, source : String)
+      _, source = self.normalize_key_source(key, source)
+      self.new(name, source)
     end
 
-    def specs(versions)
-      specs = {} of String => Spec
-      versions.each { |version| specs[version] = spec(version) }
-      specs
+    def self.normalize_key_source(key : String, source : String)
+      {key, source}
     end
 
-    def installed_spec
-      return unless installed?
-
-      path = File.join(install_path, SPEC_FILENAME)
-      return Spec.from_file(path) if File.exists?(path)
-
-      raise Error.new("Missing #{SPEC_FILENAME.inspect} for #{dependency.name.inspect}")
+    def ==(other : Resolver)
+      return true if super
+      return false unless self.class == other.class
+      name == other.name && source == other.source
     end
 
-    def installed?
-      File.exists?(install_path)
+    def yaml_source_entry
+      "#{self.class.key}: #{source}"
     end
 
-    abstract def read_spec(version = nil)
-    abstract def spec?(version)
-    abstract def available_versions
-    abstract def install(version = nil)
-    abstract def installed_commit_hash
+    def to_s(io : IO)
+      io << yaml_source_entry
+    end
 
-    def run_script(name)
-      if installed? && (command = installed_spec.try(&.scripts[name]?))
-        Shards.logger.info "#{name.capitalize} #{command}"
-        Script.run(install_path, command)
+    def versions_for(req : Requirement) : Array(Version)
+      case req
+      when Version then [req]
+      when Ref
+        [latest_version_for_ref(req)]
+      when VersionReq
+        Versions.resolve(available_releases, req)
+      when Any
+        releases = available_releases
+        if releases.empty?
+          [latest_version_for_ref(nil)]
+        else
+          releases
+        end
+      else
+        raise Error.new("Unexpected requirement type: #{req}")
       end
     end
 
-    def install_path
-      File.join(Shards.install_path, dependency.name)
+    abstract def available_releases : Array(Version)
+
+    def latest_version_for_ref(ref : Ref?) : Version
+      raise "Unsupported ref type for this resolver: #{ref}"
     end
 
-    protected def cleanup_install_directory
-      Shards.logger.debug "rm -rf '#{Helpers::Path.escape(install_path)}'"
-      FileUtils.rm_rf(install_path)
+    def matches_ref?(ref : Ref, version : Version)
+      false
     end
-  end
 
-  @@resolver_classes = {} of String => Resolver.class
-  @@resolvers = {} of String => Resolver
-
-  def self.register_resolver(resolver)
-    @@resolver_classes[resolver.key] = resolver
-  end
-
-  def self.find_resolver(dependency)
-    @@resolvers[dependency.name] ||= begin
-      klass = get_resolver_class(dependency.keys)
-      raise Error.new("Failed can't resolve dependency #{dependency.name} (unsupported resolver)") unless klass
-      klass.new(dependency)
-    end
-  end
-
-  private def self.get_resolver_class(names)
-    names.each do |name|
-      if resolver = @@resolver_classes[name.to_s]?
-        return resolver
+    def spec(version : Version) : Spec
+      if spec = load_spec(version)
+        spec.version = version
+        spec
+      else
+        Spec.new(name, version, self)
       end
     end
 
-    nil
+    private def load_spec(version)
+      if spec_yaml = read_spec(version)
+        Spec.from_yaml(spec_yaml).tap do |spec|
+          spec.resolver = self
+        end
+      end
+    rescue error : ParseError
+      error.resolver = self
+      raise error
+    end
+
+    abstract def read_spec(version : Version) : String?
+    abstract def install_sources(version : Version, install_dir : String)
+    abstract def report_version(version : Version) : String
+
+    def parse_requirement(params : Hash(String, String)) : Requirement
+      if version = params["version"]?
+        VersionReq.new version
+      else
+        Any
+      end
+    end
+
+    private record ResolverCacheKey, key : String, name : String, source : String
+    private RESOLVER_CLASSES = {} of String => Resolver.class
+    private RESOLVER_CACHE   = {} of ResolverCacheKey => Resolver
+
+    def self.register_resolver(key, resolver)
+      RESOLVER_CLASSES[key] = resolver
+    end
+
+    def self.clear_resolver_cache
+      RESOLVER_CACHE.clear
+    end
+
+    def self.find_class(key : String) : Resolver.class | Nil
+      RESOLVER_CLASSES[key]?
+    end
+
+    def self.find_resolver(key : String, name : String, source : String)
+      resolver_class =
+        if self == Resolver
+          RESOLVER_CLASSES[key]? ||
+            raise Error.new("Failed can't resolve dependency #{name} (unsupported resolver)")
+        else
+          self
+        end
+
+      key, source = resolver_class.normalize_key_source(key, source)
+
+      RESOLVER_CACHE[ResolverCacheKey.new(key, name, source)] ||= begin
+        resolver_class.build(key, name, source)
+      end
+    end
   end
 end
+
+require "./*"

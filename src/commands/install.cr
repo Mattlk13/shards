@@ -1,100 +1,102 @@
 require "./command"
-require "../solver"
+require "../molinillo_solver"
 
 module Shards
   module Commands
     class Install < Command
       def run
-        Shards.logger.info { "Resolving dependencies" }
+        if Shards.frozen? && !lockfile?
+          raise Error.new("Missing shard.lock")
+        end
 
-        solver = Solver.new(spec)
+        Log.info { "Resolving dependencies" }
+
+        solver = MolinilloSolver.new(spec, override)
 
         if lockfile?
           # install must be as conservative as possible:
-          solver.locks = locks
+          solver.locks = locks.shards
         end
 
-        solver.prepare(development: !Shards.production?)
+        solver.prepare(development: Shards.with_development?)
 
-        if packages = solver.solve
-          return if packages.empty?
+        packages = handle_resolver_errors { solver.solve }
 
-          if lockfile?
-            validate(packages)
-          end
-
-          install(packages)
-
-          if generate_lockfile?(packages)
-            write_lockfile(packages)
-          end
-        else
-          solver.each_conflict do |message|
-            Shards.logger.warn { "Conflict #{message}" }
-          end
-          raise Shards::Error.new("Failed to resolve dependencies")
+        if Shards.frozen?
+          validate(packages)
         end
+
+        install(packages)
+
+        if generate_lockfile?(packages)
+          write_lockfile(packages)
+        elsif !Shards.frozen?
+          # Touch lockfile so its mtime is bigger than that of shard.yml
+          File.touch(lockfile_path)
+        end
+
+        # Touch install path so its mtime is bigger than that of the lockfile
+        touch_install_path
+
+        check_crystal_version(packages)
       end
 
       private def validate(packages)
         packages.each do |package|
-          if lock = locks.find { |d| d.name == package.name }
-            if version = lock.version?
-              validate_locked_version(package, version)
-            elsif commit = lock["commit"]?
-              validate_locked_commit(package, commit)
+          if lock = locks.shards.find { |d| d.name == package.name }
+            if lock.resolver != package.resolver
+              raise LockConflict.new("#{package.name} source changed")
             else
-              raise InvalidLock.new # unknown lock resolver
+              validate_locked_version(package, lock.version)
             end
-          elsif Shards.production?
+          else
             raise LockConflict.new("can't install new dependency #{package.name} in production")
           end
         end
       end
 
       private def validate_locked_version(package, version)
-        return if Shards.production? && package.version == version
-        return if Versions.matches?(version, package.spec.version)
-        raise LockConflict.new("#{package.name} requirements changed")
-      end
-
-      private def validate_locked_commit(package, commit)
-        return if commit == package.commit
+        return if package.version == version
         raise LockConflict.new("#{package.name} requirements changed")
       end
 
       private def install(packages : Array(Package))
-        # first install all dependencies:
-        installed = packages.compact_map { |package| install(package) }
+        # packages are returned by the solver in reverse topological order,
+        # so transitive dependencies are installed first
+        packages.each do |package|
+          # first install the dependency:
+          next unless install(package)
 
-        # then execute the postinstall script of installed dependencies (with
-        # access to all transitive dependencies):
-        installed.each(&.postinstall)
+          # then execute the postinstall script
+          # (with access to all transitive dependencies):
+          package.postinstall
 
-        # always install executables because the path resolver never actually
-        # installs dependencies:
-        packages.each(&.install_executables)
+          # always install executables because the path resolver never actually
+          # installs dependencies:
+          package.install_executables
+        end
       end
 
       private def install(package : Package)
         if package.installed?
-          Shards.logger.info { "Using #{package.name} (#{package.report_version})" }
+          Log.info { "Using #{package.name} (#{package.report_version})" }
           return
         end
 
-        Shards.logger.info { "Installing #{package.name} (#{package.report_version})" }
+        Log.info { "Installing #{package.name} (#{package.report_version})" }
         package.install
         package
       end
 
       private def generate_lockfile?(packages)
-        !Shards.production? && !packages.empty? && (!lockfile? || outdated_lockfile?(packages))
+        !Shards.frozen? && (!lockfile? || outdated_lockfile?(packages))
       end
 
       private def outdated_lockfile?(packages)
-        a = packages.map { |x| {x.name, x.version, x.commit} }
-        b = locks.map { |x| {x.name, x["version"]?, x["commit"]?} }
-        a != b
+        return true if locks.version != Shards::Lock::CURRENT_VERSION
+        return true if packages.size != locks.shards.size
+
+        packages.index_by(&.name) != locks.shards.index_by(&.name)
       end
     end
   end

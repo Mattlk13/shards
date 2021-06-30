@@ -2,7 +2,7 @@ module Shards
   module Versions
     # :nodoc:
     struct Segment
-      NON_ALPHANUMERIC = /[^a-zA-Z0-9]/
+      NON_ALPHANUMERIC                           = /[^a-zA-Z0-9]/
       NATURAL_SORT_EXTRACT_NEXT_CHARS_AND_DIGITS = /^(\D*)(\d*)(.*)$/
 
       protected getter! segment : String
@@ -88,7 +88,11 @@ module Shards
       versions.sort { |a, b| compare(a, b) }
     end
 
-    def self.compare(a, b)
+    def self.compare(a : Version, b : Version)
+      compare(a.value, b.value)
+    end
+
+    def self.compare(a : String, b : String)
       if a == b
         return 0
       end
@@ -121,7 +125,6 @@ module Shards
           if a_num && b_num
             # compare numbers (for natural 1, 2, ..., 10, 11 ordering):
             b_num <=> a_num
-
           elsif a_num
             # b is preliminary version:
             a_segment.only_zeroes? do
@@ -129,7 +132,6 @@ module Shards
               return -1
             end
             return -1
-
           elsif b_num
             # a is preliminary version:
             b_segment.only_zeroes? do
@@ -137,7 +139,6 @@ module Shards
               return 1
             end
             return 1
-
           else
             # compare strings:
             b_segment <=> a_segment
@@ -149,7 +150,7 @@ module Shards
       end
     end
 
-    def self.prerelease?(str)
+    def self.prerelease?(str : String)
       str.each_char do |char|
         return true if char.ascii_letter?
         break if char == '+'
@@ -157,42 +158,26 @@ module Shards
       false
     end
 
-    protected def self.without_prereleases(versions)
-      versions.reject { |v| prerelease?(v) }
+    def self.has_metadata?(str : String)
+      str.includes? '+'
     end
 
-    def self.resolve(versions, requirements : Enumerable(String), prereleases = false)
-      unless prereleases || requirements.any? { |r| prerelease?(r) }
-        versions = without_prereleases(versions)
-      end
-
-      matching_versions = requirements
-        .map { |requirement| resolve(versions, requirement) }
-        .reduce(versions) { |a, e| a & e }
-
-      sort(matching_versions)
+    protected def self.without_prereleases(versions : Array(Version))
+      versions.reject { |v| prerelease?(v.value) }
     end
 
-    def self.resolve(versions, requirement : String)
-      case requirement
-      when "*", ""
-        versions
-      when /~>\s*([^\s]+)/
-        ver = if idx = $1.rindex('.')
-                $1[0...idx]
-              else
-                $1
-              end
-        versions.select { |version| matches_approximate?(version, $1, ver) }
-      when /\s*(~>|>=|<=|>|<|=)\s*([^~<>=\s]+)\s*/
-        versions.select { |version| matches_operator?(version, $1, $2) }
-      else
-        versions.select { |version| matches_operator?(version, "=", requirement) }
+    def self.resolve(versions : Array(Version), requirement : VersionReq)
+      versions.select { |version| matches?(version, requirement) }
+    end
+
+    def self.matches?(version : Version, requirement : VersionReq)
+      requirement.patterns.all? do |pattern|
+        matches_single_pattern?(version, pattern)
       end
     end
 
-    def self.matches?(version : String, requirement : String)
-      case requirement
+    private def self.matches_single_pattern?(version : Version, pattern : String)
+      case pattern
       when "*", ""
         true
       when /~>\s*([^\s]+)\d*/
@@ -201,11 +186,11 @@ module Shards
               else
                 $1
               end
-        matches_approximate?(version, $1, ver)
+        matches_approximate?(version.value, $1, ver)
       when /\s*(~>|>=|<=|>|<|=)\s*([^~<>=\s]+)\s*/
-        matches_operator?(version, $1, $2)
+        matches_operator?(version.value, $1, $2)
       else
-        matches_operator?(version, "=", requirement)
+        matches_operator?(version.value, "=", pattern)
       end
     end
 

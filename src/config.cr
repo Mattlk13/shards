@@ -1,13 +1,17 @@
+require "./info"
+
 module Shards
-  SPEC_FILENAME = "shard.yml"
-  LOCK_FILENAME = "shard.lock"
+  SPEC_FILENAME     = "shard.yml"
+  LOCK_FILENAME     = "shard.lock"
+  OVERRIDE_FILENAME = "shard.override.yml"
+  INSTALL_DIR       = "lib"
 
   DEFAULT_COMMAND = "install"
   DEFAULT_VERSION = "0"
 
-  VERSION_REFERENCE = /^v?\d+[-.][-.a-zA-Z\d]+$/
-  VERSION_TAG = /^v(\d+[-.][-.a-zA-Z\d]+)$/
-  VERSION_AT_GIT_COMMIT = /\+git\.commit\.([0-9a-f]+)$/
+  VERSION_REFERENCE     = /^v?\d+[-.][-.a-zA-Z\d]+$/
+  VERSION_TAG           = /^v(\d+[-.][-.a-zA-Z\d]+)$/
+  VERSION_AT_GIT_COMMIT = /^(\d+[-.][-.a-zA-Z\d]+)\+git\.commit\.([0-9a-f]+)$/
 
   def self.cache_path
     @@cache_path ||= find_or_create_cache_path
@@ -31,7 +35,7 @@ module Shards
       begin
         Dir.mkdir_p(path)
         return path
-      rescue Errno
+      rescue File::Error
       end
     end
 
@@ -43,26 +47,15 @@ module Shards
 
   def self.install_path
     @@install_path ||= begin
-      warn_about_legacy_libs_path
-      ENV.fetch("SHARDS_INSTALL_PATH") { File.join(Dir.current, "lib") }
+      ENV.fetch("SHARDS_INSTALL_PATH") { File.join(Dir.current, INSTALL_DIR) }
     end
   end
 
   def self.install_path=(@@install_path : String)
   end
 
-  private def self.warn_about_legacy_libs_path
-    # TODO: drop me in a future release
-
-    legacy_install_path = if path = ENV["SHARDS_INSTALL_PATH"]?
-                            File.join(File.dirname(path), "libs")
-                          else
-                            File.join(Dir.current, "libs")
-                          end
-
-    if File.exists?(legacy_install_path)
-      Shards.logger.warn "Shards now installs dependencies into the 'lib' folder. You may delete the legacy 'libs' folder."
-    end
+  def self.info
+    @@info ||= Info.new
   end
 
   def self.bin_path
@@ -72,6 +65,38 @@ module Shards
   def self.bin_path=(@@bin_path : String)
   end
 
-  class_property? production = false
+  def self.global_override_filename
+    ENV["SHARDS_OVERRIDE"]?.try { |p| File.expand_path(p) }
+  end
+
+  def self.crystal_version
+    @@crystal_version ||= without_prerelease(ENV["CRYSTAL_VERSION"]? || begin
+      output = IO::Memory.new
+      error = IO::Memory.new
+      status = begin
+        Process.run("crystal", {"env", "CRYSTAL_VERSION"}, output: output, error: error)
+      rescue e
+        raise Error.new("Could not execute 'crystal': #{e.message}")
+      end
+      raise Error.new("Error executing crystal:\n#{error}") unless status.success?
+      output.to_s.strip
+    end)
+  end
+
+  def self.crystal_version(@@crystal_version : String)
+  end
+
+  private def self.without_prerelease(version)
+    if version =~ /^(\d+)\.(\d+)\.(\d+)([^\w]\w+)$/
+      "#{$1}.#{$2}.#{$3}"
+    else
+      version
+    end
+  end
+
+  class_property? frozen = false
+  class_property? with_development = true
   class_property? local = false
+  class_property? skip_postinstall = false
+  class_property? skip_executables = false
 end

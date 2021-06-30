@@ -1,14 +1,17 @@
 require "../lock"
 require "../spec"
+require "../override"
 
 module Shards
   abstract class Command
     getter path : String
     getter spec_path : String
     getter lockfile_path : String
+    getter override_path : String?
 
     @spec : Spec?
-    @locks : Array(Dependency)?
+    @locks : Lock?
+    @override : Override?
 
     def initialize(path)
       if File.directory?(path)
@@ -19,9 +22,15 @@ module Shards
         @spec_path = path
       end
       @lockfile_path = File.join(@path, LOCK_FILENAME)
-    end
 
-    abstract def run(*args, **kwargs)
+      # If global override is defined via SHARDS_OVERRIDE env var we use that.
+      # Otherwise we check if the is a shard.override.yml file next to the shard.yml
+      @override_path = Shards.global_override_filename
+      unless @override_path
+        local_override = File.join(@path, OVERRIDE_FILENAME)
+        @override_path = File.exists?(local_override) ? local_override : nil
+      end
+    end
 
     def self.run(path, *args, **kwargs)
       new(path).run(*args, **kwargs)
@@ -51,9 +60,41 @@ module Shards
       File.exists?(lockfile_path)
     end
 
+    def override
+      @override ||= override_path.try { |p| Shards::Override.from_file(p) }
+    end
+
     def write_lockfile(packages)
-      Shards.logger.info { "Writing #{LOCK_FILENAME}" }
-      Shards::Lock.write(packages, LOCK_FILENAME)
+      Log.info { "Writing #{LOCK_FILENAME}" }
+
+      override_path = @override_path
+      override_path = File.basename(override_path) if override_path && File.dirname(override_path) == @path
+
+      Shards::Lock.write(packages, override_path, LOCK_FILENAME)
+    end
+
+    def handle_resolver_errors
+      yield
+    rescue e : Molinillo::ResolverError
+      Log.error { e.message }
+      raise Shards::Error.new("Failed to resolve dependencies")
+    end
+
+    def check_crystal_version(packages)
+      crystal_version = Shards::Version.new Shards.crystal_version
+
+      packages.each do |package|
+        crystal_req = MolinilloSolver.crystal_version_req(package.spec)
+
+        if !Shards::Versions.matches?(crystal_version, crystal_req)
+          Log.warn { "Shard \"#{package.name}\" may be incompatible with Crystal #{Shards.crystal_version}" }
+        end
+      end
+    end
+
+    def touch_install_path
+      Dir.mkdir_p(Shards.install_path)
+      File.touch(Shards.install_path)
     end
   end
 end

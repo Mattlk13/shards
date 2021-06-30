@@ -6,59 +6,26 @@ module Shards
       "path"
     end
 
-    def read_spec(version = nil)
+    def read_spec(version = nil) : String?
       spec_path = File.join(local_path, SPEC_FILENAME)
 
       if File.exists?(spec_path)
         File.read(spec_path)
       else
-        raise Error.new("Missing #{SPEC_FILENAME.inspect} for #{dependency.name.inspect}")
+        raise Error.new("Missing #{SPEC_FILENAME.inspect} for #{name.inspect}")
       end
     end
 
-    def dependency_path
-      @dependency.path
+    def spec(version = nil)
+      load_spec(version) || raise Error.new("Can't read spec for #{name.inspect}")
     end
 
-    def spec?(version)
-      spec_path = File.join(local_path, SPEC_FILENAME)
-
-      if File.exists?(spec_path)
-        Spec.from_yaml(File.read(spec_path))
-        # TODO: fail if the spec isn't the expected version!
-      end
-    end
-
-    def installed_spec
-      Spec.from_yaml(read_spec) if installed?
-    end
-
-    def installed_commit_hash
-    end
-
-    def installed?
-      File.symlink?(install_path) && check_install_path_target
-    end
-
-    private def check_install_path_target
-      begin
-        real_install_path = File.real_path(install_path)
-      rescue errno : Errno
-        if errno.errno == Errno::ENOENT
-          return false
-        else
-          raise errno
-        end
-      end
-      real_install_path == expanded_local_path
-    end
-
-    def available_versions
-      [spec.version]
+    def available_releases : Array(Version)
+      [spec(nil).version]
     end
 
     def local_path
-      dependency["path"].to_s
+      source
     end
 
     private def expanded_local_path
@@ -67,14 +34,17 @@ module Shards
       end
     end
 
-    def install(version = nil)
+    def install_sources(version, install_path)
       path = expanded_local_path
 
-      cleanup_install_directory
       Dir.mkdir_p(File.dirname(install_path))
       File.symlink(path, install_path)
     end
-  end
 
-  register_resolver PathResolver
+    def report_version(version : Version) : String
+      "#{version.value} at #{source}"
+    end
+
+    register_resolver "path", PathResolver
+  end
 end
